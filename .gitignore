@@ -1,0 +1,66 @@
+# Xcode
+build/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+!default.pbxuser
+!default.mode1v3
+!default.mode2v3
+!default.perspectivev3
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# SPM
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Secrets — never commit real keys
+*.xcconfig.local
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node & Expo
+node_modules/
+.expo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local root screenshots
+/image*.png
+
+# Large built binaries
+*.apk
+
+
+# Next.js
+.next/
+out/
+
+# Cloned temporary repos
+calQ/
+.agents/
+skills-lock.json
+
+# Per-user Claude Code settings
+**/.claude/settings.local.json
+
+# iOS app secrets (copy Secrets.swift.example)
+parkezy-2.0/parkezy/parkezy/Backend/Secrets.swift
