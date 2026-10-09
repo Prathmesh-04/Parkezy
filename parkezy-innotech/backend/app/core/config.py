@@ -1,0 +1,356 @@
+"""Infrastructure configuration, read from environment variables / .env.
+
+Business rules (GST, commission, overstay fees, booking limits…) are NOT here: they live
+in the `platform_settings` table so an admin can change them at runtime
+(see app/services/settings_service.py).
+"""
+
+import os
+from email.utils import parseaddr
+from functools import lru_cache
+from typing import Annotated, Literal
+
+from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+
+def _split_csv(value: object) -> object:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return value
+
+
+class RiskRule(BaseModel):
+    """One login risk signal: `weight` points per full `threshold` reached, at most `cap` times.
+
+    points = weight * min(cap, count // threshold). A negative weight lowers the score."""
+
+    threshold: int = Field(ge=1)
+    weight: int
+    cap: int = Field(default=3, ge=1)
+
+
+# Tuned so a few typos stay LOW, sustained guessing reaches MEDIUM (challenge), and only several
+# independent signals together reach HIGH. See docs/login-protection.md for how to retune.
+DEFAULT_LOGIN_RISK_RULES: dict[str, RiskRule] = {
+    # failed logins in login_failure_window_seconds
+    "account_failures": RiskRule(threshold=5, weight=25),  # this account, from any IP
+    "ip_failures": RiskRule(threshold=5, weight=20),
+    "subnet_failures": RiskRule(threshold=20, weight=15),  # IPv4 /24, IPv6 /64
+    "device_failures": RiskRule(threshold=5, weight=20),
+    # spread of failures (successful sign-ins never count, so shared NATs stay clean)
+    "ip_distinct_accounts": RiskRule(threshold=4, weight=25),  # accounts that failed from one IP
+    "account_distinct_ips": RiskRule(threshold=5, weight=20),  # IPs that failed on one account
+    # failed logins across the whole service in rate_limit_window_seconds (attack in progress)
+    "global_failures": RiskRule(threshold=100, weight=15),
+    # request consistency
+    "automation_user_agent": RiskRule(threshold=1, weight=15, cap=1),
+    "missing_user_agent": RiskRule(threshold=1, weight=10, cap=1),
+    # this device signed in to this account before
+    "known_device": RiskRule(threshold=1, weight=-30, cap=1),
+}
+
+
+def normalize_database_url(value: object) -> object:
+    """Accept provider connection strings as-is (Neon, Render, Supabase all hand out libpq URLs).
+
+    asyncpg takes `ssl=`, not libpq's `sslmode=`, and rejects `channel_binding=` outright, so a
+    pasted `postgresql://…?sslmode=require&channel_binding=require` would fail at first connect.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    url = make_url(value)
+    if url.drivername in ("postgres", "postgresql", "postgresql+psycopg2", "postgresql+psycopg"):
+        url = url.set(drivername="postgresql+asyncpg")
+    query = dict(url.query)
+    query.pop("channel_binding", None)  # SCRAM channel binding is negotiated by asyncpg itself
+    if "sslmode" in query:
+        query.setdefault("ssl", query.pop("sslmode"))
+    return url.set(query=query).render_as_string(hide_password=False)
+
+
+def uses_pgbouncer(url: str) -> bool:
+    """Neon's pooled endpoint (`*-pooler.*`) is PgBouncer in transaction mode."""
+    return "-pooler." in (make_url(url).host or "")
+
+
+class Settings(BaseSettings):
+    # ENV_FILE picks another file, e.g. ENV_FILE=.env.production for the hosted services.
+    # env_ignore_empty: `RESEND_WEBHOOK_SECRET=` in a .env means "not configured" (None), never an
+    # empty secret — an empty HMAC key would let anyone forge signatures.
+    model_config = SettingsConfigDict(
+        env_file=os.environ.get("ENV_FILE", ".env"), env_file_encoding="utf-8", extra="ignore", env_ignore_empty=True
+    )
+
+    # --- App ---
+    app_env: Literal["local", "test", "staging", "production"] = "local"
+    app_name: str = "Parkezy"
+    api_public_url: AnyHttpUrl = AnyHttpUrl("https://parkezy-api.onrender.com")
+    app_deep_link_base: str = Field(default="parkezy://", description="Base URL the mobile app opens, e.g. parkezy://")
+    log_level: str = "INFO"
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    admin_emails: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    default_timezone: str = "Asia/Kolkata"
+    trust_forwarded_for: bool = Field(
+        default=False, description="Use X-Forwarded-For for client IP (only behind a trusted proxy)"
+    )
+
+    # --- Support & legal (shown in the Terms / Privacy Policy and used for support tickets) ---
+    support_email: str = "support@parkezy.com"
+    legal_entity_name: str = "Parkezy"
+    legal_address: str = "Bengaluru, Karnataka, India"
+    # Grievance Officer required by the IT Rules 2021 and the DPDP Act 2023; defaults to support.
+    grievance_officer_name: str = "Grievance Officer, Parkezy"
+    grievance_officer_email: str | None = None
+
+    # --- Database ---
+    database_url: str
+    # Optional streaming replica for read-heavy discovery (search, listing pages). Empty = primary.
+    database_read_url: str | None = None
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
+    db_echo: bool = False
+    # Recycle before the provider's idle timeout closes the socket under us (Neon, PgBouncer, cloud LBs).
+    db_pool_recycle_seconds: int = 300
+    # Disable asyncpg statement caching for transaction-mode PgBouncer. Empty = auto-detect `-pooler` hosts.
+    db_pgbouncer: bool | None = None
+    # Client-side per-statement ceiling (asyncpg command_timeout) so one slow query cannot pin a
+    # pooled connection forever. Client-side because PgBouncer drops server startup parameters.
+    db_command_timeout_seconds: float = 15.0
+    # How long a request waits for a free pooled connection before getting a 503 (SQLAlchemy's own
+    # default is 30 s, which turns a busy pool into 30-second hangs followed by errors).
+    db_pool_timeout_seconds: float = 3.0
+    # How long opening a new connection may take (asyncpg's default is 60 s).
+    db_connect_timeout_seconds: float = 5.0
+    # Retry-After sent with 503s when the database is busy or unreachable.
+    db_unavailable_retry_after_seconds: int = 5
+
+    # --- Request guards ---
+    # Largest request body accepted, in bytes. Photos and evidence go straight to object storage
+    # through presigned URLs, so API bodies are small JSON documents.
+    request_max_body_bytes: int = 1024 * 1024
+
+    # --- Health checks ---
+    # Upper bound for each dependency check in /health/ready, so the probe always answers quickly.
+    health_check_timeout_seconds: float = 2.0
+
+    # --- Redis / jobs ---
+    redis_url: str
+    # Bounded timeouts: the rate limiter and cache fail open on RedisError, which only helps if
+    # a hung Redis actually raises instead of stalling every request.
+    redis_socket_timeout_seconds: float = 2.0
+    redis_health_check_seconds: int = 30
+    # Per process. Hosted free tiers cap clients (Redis Cloud free: 30), and API workers, Celery
+    # workers and beat all share that budget, so keep each pool small and wait for a free slot.
+    redis_max_connections: int = 10
+    celery_broker_url: str | None = None
+    celery_broker_pool_limit: int = 4
+    outbox_sweep_seconds: int = 30
+    outbox_batch_size: int = 50
+    outbox_max_attempts: int = 10
+    outbox_backoff_base_seconds: int = 15
+    outbox_backoff_max_seconds: int = 3600
+    maintenance_sweep_seconds: int = 60
+    cleanup_interval_hours: int = 24
+    stale_upload_hours: int = 24
+
+    # --- Auth ---
+    jwt_secret: SecretStr
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "parkezy-api"
+    jwt_audience: str = "parkezy-app"
+    access_token_ttl_minutes: int = 15
+    refresh_token_ttl_days: int = 30
+    verification_code_ttl_minutes: int = 15
+    verification_code_max_attempts: int = 5
+    verification_code_length: int = 6
+    # Password hashes computed at once per worker process. Each argon2 hash takes ~70 ms of CPU and
+    # 64 MiB of memory; hashing runs in threads so other requests keep flowing, and this caps the
+    # memory (workers x this x 64 MiB). Extra sign-ins wait their turn instead of piling up.
+    password_hash_concurrency: int = Field(default=2, ge=1, le=32)
+
+    # --- Parking access (PIN / QR) ---
+    access_code_secret: SecretStr
+    access_pin_length: int = 6
+    qr_token_ttl_seconds: int = 120
+
+    # --- Rate limits (requests per window) ---
+    rate_limit_window_seconds: int = 60
+    rate_limit_auth_per_window: int = 10
+    rate_limit_access_verify_per_window: int = 20
+    rate_limit_default_per_window: int = 120
+    # Emails one address/account can trigger on demand (password reset, verification resend), across
+    # all IPs. Stops inbox bombing and stops anyone draining the email provider's daily quota.
+    rate_limit_email_per_window: int = 3
+    rate_limit_email_window_seconds: int = 900
+
+    # --- Login abuse protection (app/services/login_protection.py, docs/login-protection.md) ---
+    login_protection_enabled: bool = True
+    login_failure_window_seconds: int = Field(default=900, ge=60)
+    # Hard ceilings per rate_limit_window_seconds, on top of the per-IP and per-account auth limits.
+    login_subnet_attempts_per_window: int = Field(default=60, ge=1)
+    login_device_attempts_per_window: int = Field(default=20, ge=1)
+    login_global_attempts_per_window: int = Field(default=3000, ge=1)
+    # Scores: < medium = allow, >= medium = challenge, >= high = temporary rejection.
+    login_risk_medium_score: int = 40
+    login_risk_high_score: int = 80
+    # JSON object; keys you give replace the defaults, e.g. {"account_failures": {"threshold": 3, "weight": 30}}
+    login_risk_rules: dict[str, RiskRule] = Field(default_factory=dict)
+    login_throttle_retry_seconds: int = Field(default=120, ge=1)
+    login_known_device_ttl_days: int = Field(default=90, ge=1)
+    # Used only while Redis is unreachable: per-process attempts per IP and per account per window.
+    login_fallback_attempts_per_window: int = Field(default=20, ge=1)
+    # Challenge (CAPTCHA) for medium risk. With "none", medium risk is a short slow-down instead.
+    login_challenge_provider: Literal["none", "turnstile"] = "none"
+    login_challenge_unavailable_retry_seconds: int = Field(default=30, ge=1)
+    login_challenge_action: str = "login"
+    login_challenge_max_age_seconds: int = Field(default=300, ge=10)
+    login_challenge_expected_hostnames: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    turnstile_site_key: str | None = None
+    turnstile_secret_key: SecretStr | None = None
+    turnstile_verify_url: AnyHttpUrl = AnyHttpUrl("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+
+    # --- Caching / bloom filters ---
+    search_cache_ttl_seconds: int = 30
+    # geohash-cell caching: cell half-diagonal <= ratio * radius; fetch limit * multiplier candidates per cell
+    search_cell_error_ratio: float = 0.25
+    search_candidate_multiplier: int = 3
+    rules_cache_ttl_seconds: int = 60
+    bloom_capacity: int = 1_000_000
+    bloom_error_rate: float = 0.001
+
+    # --- Email ---
+    email_provider: Literal["resend", "smtp", "console"] = "console"
+    # Must be on a domain verified in Resend, e.g. "Parkezy <noreply@mail.kartik2976.xyz>".
+    email_from: str = "Parkezy <noreply@mail.kartik2976.xyz>"
+    email_reply_to: str | None = None
+    resend_api_key: SecretStr | None = None
+    resend_api_base: AnyHttpUrl = AnyHttpUrl("https://api.resend.com")
+    resend_webhook_secret: SecretStr | None = None
+    smtp_host: str | None = None
+    smtp_port: int = 1025
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_use_tls: bool = False
+
+    # --- Object storage (Backblaze B2 S3 API in prod, SeaweedFS locally) ---
+    s3_endpoint_url: str
+    s3_public_endpoint_url: str | None = Field(
+        default=None, description="Endpoint the mobile app can reach, if different (e.g. LAN IP)"
+    )
+    s3_region: str
+    s3_access_key_id: SecretStr
+    s3_secret_access_key: SecretStr
+    s3_bucket: str
+    s3_public_base_url: str | None = Field(
+        default=None, description="CDN/public bucket URL for public media; presigned GET if unset"
+    )
+    s3_presign_ttl_seconds: int = 900
+    upload_max_bytes: int = 10 * 1024 * 1024
+    upload_allowed_types: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["image/jpeg", "image/png", "image/heic", "image/webp"]
+    )
+
+    # --- Payments ---
+    payment_provider: Literal["razorpay", "offline"] = "offline"
+    razorpay_key_id: str | None = None
+    razorpay_key_secret: SecretStr | None = None
+    razorpay_webhook_secret: SecretStr | None = None
+    razorpay_api_base: AnyHttpUrl = AnyHttpUrl("https://api.razorpay.com/v1")
+    payment_reconcile_interval_seconds: int = 300
+    payment_reconcile_after_minutes: int = 5
+    payment_abandon_after_minutes: int = 60
+    payment_reconcile_batch: int = 100
+
+    # --- Push notifications ---
+    push_provider: Literal["expo", "none"] = "none"
+    expo_push_url: AnyHttpUrl = AnyHttpUrl("https://exp.host/--/api/v2/push/send")
+    expo_access_token: SecretStr | None = None
+
+    # --- Sign in with Google / Apple (comma-separated OAuth client ids; empty disables the provider) ---
+    google_client_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    apple_client_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Clerk (Google sign-in in the app). Clerk session tokens carry no email by default: either add
+    # an "email" claim to the session token in the Clerk dashboard, or set the secret key so the API
+    # can look up the user's verified email itself. The email the app sends is never trusted.
+    clerk_secret_key: SecretStr | None = None
+    clerk_api_base: AnyHttpUrl = AnyHttpUrl("https://api.clerk.com/v1")
+
+    # --- External HTTP ---
+    http_timeout_seconds: float = 10.0
+
+    # --- Observability ---
+    sentry_dsn: SecretStr | None = None
+    sentry_traces_sample_rate: float = 0.0
+    metrics_token: SecretStr | None = Field(
+        default=None, description="Bearer token for GET /metrics; empty disables it"
+    )
+
+    _csv = field_validator(
+        "cors_origins",
+        "admin_emails",
+        "upload_allowed_types",
+        "google_client_ids",
+        "apple_client_ids",
+        "login_challenge_expected_hostnames",
+        mode="before",
+    )(_split_csv)
+    _db_url = field_validator("database_url", "database_read_url", mode="before")(normalize_database_url)
+
+    @field_validator("admin_emails")
+    @classmethod
+    def _lower(cls, v: list[str]) -> list[str]:
+        return [e.lower() for e in v]
+
+    @model_validator(mode="after")
+    def _validate_providers(self) -> "Settings":
+        if self.email_provider == "resend" and not self.resend_api_key:
+            raise ValueError("EMAIL_PROVIDER=resend requires RESEND_API_KEY")
+        if "@" not in parseaddr(self.email_from)[1]:
+            raise ValueError('EMAIL_FROM must be an address, e.g. "Parkezy <noreply@mail.example.com>"')
+        if self.email_provider == "console" and self.app_env not in ("local", "test"):
+            # The console sender logs whole emails, verification and reset codes included.
+            raise ValueError(f"EMAIL_PROVIDER=console is only allowed locally, not in {self.app_env}")
+        if self.email_provider == "smtp" and not self.smtp_host:
+            raise ValueError("EMAIL_PROVIDER=smtp requires SMTP_HOST")
+        if self.payment_provider == "razorpay" and not (
+            self.razorpay_key_id and self.razorpay_key_secret and self.razorpay_webhook_secret
+        ):
+            raise ValueError(
+                "PAYMENT_PROVIDER=razorpay requires RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET"
+            )
+        if self.login_challenge_provider == "turnstile" and not (self.turnstile_site_key and self.turnstile_secret_key):
+            raise ValueError("LOGIN_CHALLENGE_PROVIDER=turnstile requires TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY")
+        if self.login_risk_high_score <= self.login_risk_medium_score:
+            raise ValueError("LOGIN_RISK_HIGH_SCORE must be greater than LOGIN_RISK_MEDIUM_SCORE")
+        unknown = set(self.login_risk_rules) - set(DEFAULT_LOGIN_RISK_RULES)
+        if unknown:
+            raise ValueError(f"Unknown LOGIN_RISK_RULES signals: {sorted(unknown)}")
+        if self.app_env == "production":
+            for name in ("jwt_secret", "access_code_secret"):
+                if len(getattr(self, name).get_secret_value()) < 32:
+                    raise ValueError(f"{name.upper()} must be at least 32 characters in production")
+            if "*" in self.cors_origins:
+                raise ValueError("CORS_ORIGINS=* is not allowed in production; list the allowed origins")
+        return self
+
+    @property
+    def effective_login_risk_rules(self) -> dict[str, RiskRule]:
+        return DEFAULT_LOGIN_RISK_RULES | self.login_risk_rules
+
+    def pgbouncer_for(self, url: str) -> bool:
+        return self.db_pgbouncer if self.db_pgbouncer is not None else uses_pgbouncer(url)
+
+    @property
+    def broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]

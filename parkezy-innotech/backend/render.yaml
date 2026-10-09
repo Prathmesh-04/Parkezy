@@ -1,0 +1,76 @@
+services:
+  - type: web
+    name: parkezy-api
+    runtime: docker
+    rootDir: parkezy-innotech/backend
+    dockerfilePath: Dockerfile
+    dockerContext: .
+    # API + Celery worker/beat in one container (free plan has no background workers). See the script.
+    dockerCommand: sh render-start.sh
+    plan: free
+    region: oregon
+    healthCheckPath: /health/ready
+    envVars:
+      # One web worker leaves room for the Celery worker inside the free plan's 512 MB.
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # production hides /docs and /openapi.json, and refuses short secrets or CORS_ORIGINS=*.
+      - key: APP_ENV
+        value: production
+      - key: APP_NAME
+        value: Parkezy
+      - key: API_PUBLIC_URL
+        value: https://parkezy-api.onrender.com
+      # Email via Resend. The key and webhook secret are set in the Render dashboard, never here.
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        value: Parkezy <noreply@mail.kartik2976.xyz>
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+      - key: APP_DEEP_LINK_BASE
+        value: parkezy://
+      - key: TRUST_FORWARDED_FOR
+        value: "true"
+      # Browsers only; the mobile app is not subject to CORS.
+      - key: CORS_ORIGINS
+        value: https://parkezy-landing.vercel.app
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ACCESS_CODE_SECRET
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      # Lets the API read a Clerk user's verified email server-side (Google sign-in).
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CLERK_ISSUER
+        value: https://exciting-sawfly-3079.clerk.accounts.dev
+      - key: CLERK_JWKS_URL
+        value: https://exciting-sawfly-3079.clerk.accounts.dev/.well-known/jwks.json
+      - key: PAYMENT_PROVIDER
+        value: razorpay
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: S3_ENDPOINT_URL
+        value: https://s3.us-east-005.backblazeb2.com
+      - key: S3_REGION
+        value: us-east-005
+      - key: S3_BUCKET
+        value: parkezy-v2
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
