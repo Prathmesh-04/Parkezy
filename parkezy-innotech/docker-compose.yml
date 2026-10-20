@@ -1,0 +1,130 @@
+# Local development stack. Every value comes from backend/.env (copy backend/.env.example).
+#   docker compose up -d            -> infra only (db, redis, s3, mail)
+#   docker compose --profile app up -> infra + api + worker + beat in containers
+name: parkezy
+
+x-backend: &backend
+  build: ./backend
+  env_file: ./backend/.env
+  environment:
+    # Inside the compose network services are reached by name, not localhost.
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-parkezy}:${POSTGRES_PASSWORD:-parkezy}@db:5432/${POSTGRES_DB:-parkezy}
+    REDIS_URL: redis://redis:6379/0
+    S3_ENDPOINT_URL: http://s3:8333
+    SMTP_HOST: mail
+    SMTP_PORT: "1025"
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  profiles: ["app"]
+
+services:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-parkezy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-parkezy}
+      POSTGRES_DB: ${POSTGRES_DB:-parkezy}
+    ports: ["${DB_PORT:-5434}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-parkezy}"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["${REDIS_PORT:-6380}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  # S3-compatible object store standing in for Backblaze B2 locally.
+  s3:
+    image: chrislusf/seaweedfs:4.48
+    command: server -s3 -dir=/data -s3.port=8333
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-parkezy-local}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-parkezy-local-secret}
+    ports: ["${S3_PORT:-8333}:8333"]
+    volumes: [s3data:/data]
+
+  # Catches every email sent in development. UI at http://localhost:8025
+  mail:
+    image: axllent/mailpit:latest
+    ports: ["${SMTP_PORT:-1025}:1025", "${MAILPIT_UI_PORT:-8025}:8025"]
+
+  api:
+    <<: *backend
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports: ["${API_PORT:-8000}:8000"]
+
+  worker:
+    <<: *backend
+    command: celery -A app.workers.celery_app worker --loglevel=INFO --concurrency=2
+
+  beat:
+    <<: *backend
+    command: celery -A app.workers.celery_app beat --loglevel=INFO
+
+  # ------------------------------------------------------------------ load-test monitoring
+  #   docker compose --profile monitoring up -d   -> Prometheus :9090, Grafana :3000 (admin/admin)
+  # See loadtest/README.md. Prometheus scrapes the API running on the host (loadtest/run_api.sh).
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-remote-write-receiver   # k6 pushes its results here
+      - --enable-feature=native-histograms
+    volumes:
+      - ./loadtest/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/parkezy-loadtest.json
+    volumes:
+      - ./loadtest/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./loadtest/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [prometheus]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    profiles: ["monitoring"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-parkezy}:${POSTGRES_PASSWORD:-parkezy}@db:5432/${POSTGRES_DB:-parkezy}?sslmode=disable
+    depends_on:
+      db: { condition: service_healthy }
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.74.0
+    profiles: ["monitoring"]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis: { condition: service_healthy }
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    profiles: ["monitoring"]
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes: ["/:/host:ro,rslave"]
+
+volumes:
+  pgdata:
+  s3data:
+  promdata:
+  grafanadata:
